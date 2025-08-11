@@ -1,0 +1,42 @@
+{
+  "request": {
+    "timeout": 10,
+    "user_agent_strategy": "random",
+    "delay_between_requests": 1.5
+  },
+  "fetch": {
+    "needed_unofficial_sites": 30,
+    "max_pages": 2,
+    "queries": [
+      "watch anime online",
+      "watch anime sub dub",
+      "watch anime free no ads"
+    ],
+    "engines": {
+      "bing_url": "https://www.bing.com/search?q={query}&first={offset}",
+      "bing_results_per_page": 10,
+      "bing_max_results": 50,
+      "brave_url": "https://search.brave.com/search?q={query}&offset={start}",
+      "brave_results_per_page": 10,
+      "brave_max_results": 50,
+      "google_max_results": 100
+    }
+  },
+  "url_rules": {
+    "url_length_short": 30,
+    "url_length_medium": 50,
+    "max_path_segments": 3,
+    "max_url_length": 90,
+    "blocked_extensions": [".apk", ".pdf", ".docx", ".exe"]
+  },
+  "ads": {
+    "heavy_ads_threshold": 5,
+    "moderate_ads_threshold": 3,
+    "light_ads_threshold": 1
+  },
+  "output": {
+    "folder": "output",
+    "filename_pattern": "Latest_links_{date}.json",
+    "date_format": "%Y-%m-%d"
+  }
+}

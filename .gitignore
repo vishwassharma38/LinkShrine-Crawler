@@ -1,0 +1,32 @@
+# === Python cache & build ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+
+# === Virtual environments ===
+venv/
+myenv/
+.env/
+*.env
+
+# === Output files ===
+output/*.json
+!output/results.json   # Keep only the final results.json tracked
+
+# === Logs ===
+*.log
+
+# === IDE & editor configs ===
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# === OS-specific ===
+.DS_Store
+Thumbs.db
