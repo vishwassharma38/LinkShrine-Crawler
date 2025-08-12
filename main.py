@@ -1,17 +1,20 @@
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-import os
+import glob
 import json
-import time
+import os
 import re
-import tldextract
+import time
 from datetime import datetime
-from utils.search_engines import self_healing_search
-from utils.search_engines import get_headers
-from utils.logger import log_skip, log_error
+from urllib.parse import urlparse
+
+import requests
+import tldextract
+from bs4 import BeautifulSoup
+
 from utils.ad_detection import detect_ads
+from utils.logger import log_error, log_skip
 from utils.save_results import save_results
+from utils.search_engines import get_headers, self_healing_search
+
 
 # --- Paths ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -198,17 +201,146 @@ def format_duration(seconds):
     hrs, mins = divmod(mins, 60)
     return f"{hrs:02}:{mins:02}:{secs:02}"
 
+def extract_domain(url):
+    """Extract domain from URL."""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        # Remove 'www.' prefix if present
+        if domain.startswith('www.'):
+            domain = domain[4:]
+        return domain
+    except Exception as e:
+        return None
+
+def is_blocked_domain(url, blocked_domains):
+    """Check if URL's domain is in the blocked domains list."""
+    domain = extract_domain(url)
+    if not domain:
+        return False
+    return domain in blocked_domains
+
+def load_latest_results():
+    """Loads the most recent results JSON from OUTPUT_FOLDER."""
+    files = glob.glob(os.path.join(OUTPUT_FOLDER, "*.json"))
+    if not files:
+        return None
+    latest_file = max(files, key=os.path.getmtime)
+    with open(latest_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+    
+def preflight_check_existing(results):
+    """Check existing URLs, update alive ones, remove dead ones and blocked domains."""
+    updated_sites = []
+    dead_count = 0
+    blocked_count = 0
+    misc_count = len(results.get("misc", []))
+
+    all_sites = results.get("unofficial_sites", [])
+    total_sites = len(all_sites)
+    
+    # Get blocked domains from filters
+    blocked_domains = filters.get("blocked_domains", [])
+    # Convert to lowercase for case-insensitive comparison
+    blocked_domains = [domain.lower() for domain in blocked_domains]
+
+    print(f"[~] Preflight check: {total_sites} links found in the latest results file.")
+    print(f"[~] Blocked domains loaded: {len(blocked_domains)}")
+    print(f"[~] Scanning each link...")
+
+    scanned_count = 0
+
+    for site in all_sites:
+        scanned_count += 1
+        url = site.get("url")
+        
+        # First check if domain is blocked
+        if is_blocked_domain(url, blocked_domains):
+            blocked_count += 1
+            dead_count += 1
+            domain = extract_domain(url)
+            log_error("Blocked Domain", url, f"Domain '{domain}' is in blocked_domains list")
+            
+            # Progress output for blocked domain
+            print(f"[{scanned_count}/{total_sites}] Blocked: {url} | Alive: {len(updated_sites)} | Dead: {dead_count} | Misc: {misc_count}")
+            continue
+        
+        # If not blocked, proceed with HTTP check
+        try:
+            response = requests.get(url, headers=get_headers(settings), timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                ad_score = detect_ads(response.text)
+                site["last_checked"] = datetime.utcnow().isoformat() + "Z"
+                site["ad_score"] = ad_score
+
+                if ad_score >= HEAVY_ADS_THRESHOLD:
+                    site["warning"] = "⚠️ This site contains heavy ads and pop-ups."
+                elif ad_score >= MODERATE_ADS_THRESHOLD:
+                    site["warning"] = "⚠️ This site has a moderate amount of ads."
+                elif ad_score >= LIGHT_ADS_THRESHOLD:
+                    site["warning"] = "ℹ️ Light ads present — browsing should be smooth."
+                else:
+                    site["warning"] = "✅ No ads detected — clean experience."
+
+                updated_sites.append(site)
+
+            else:
+                dead_count += 1
+                log_error("HTTP", url, f"Non-200 response: {response.status_code}")
+
+        except Exception as e:
+            dead_count += 1
+            log_error("Request", url, e)
+
+        # Progress output
+        print(f"[{scanned_count}/{total_sites}] Checked: {url} | Alive: {len(updated_sites)} | Dead: {dead_count} | Misc: {misc_count}")
+
+    updated_sites.sort(key=lambda x: x.get("ad_score", 0))
+    
+    if blocked_count > 0:
+        print(f"\n[!] Blocked domains removed: {blocked_count}")
+    
+    return updated_sites, dead_count, misc_count
+
+
 def crawl_anime_sites():
-    print(f"\n[~] Crawling until {NEEDED_UNOFFICIAL_SITES} unofficial sites are found...\n")
-    results = {"unofficial_sites": [], "misc": []}  # Removed 'official_sites'
+    print("\n[~] Starting pre-flight check for existing results...\n")
+    existing_data = load_latest_results()
+    results = {"unofficial_sites": [], "misc": []}
+
+    dead_links_to_fetch = NEEDED_UNOFFICIAL_SITES
+
+    if existing_data:
+        updated_sites, dead_count, misc_count = preflight_check_existing(existing_data)
+        results["unofficial_sites"] = updated_sites
+        results["misc"] = existing_data.get("misc", [])
+        dead_links_to_fetch = dead_count
+        print("\n[✓] Preflight Summary:")
+        print(f"    Alive Links: {len(updated_sites)}")
+        print(f"    Dead Links: {dead_count}")
+        print(f"    Misc Links: {misc_count}")
+    else:
+        results["misc"] = []
+        print("[!] No existing results found — starting from scratch.")
+
+    if dead_links_to_fetch <= 0:
+        print("\n[✓] No dead links found. Updating file and finishing.")
+        save_results(results, OUTPUT_FOLDER, FILENAME_PATTERN, DATE_FORMAT)
+        return
+
+    print(f"\n[~] Crawling to fetch {dead_links_to_fetch} new unofficial sites...\n")
     total_checked = 0
-    found_set = set()
+    found_set = {site["url"] for site in results["unofficial_sites"]}
     misc_urls = []
     query_index = 0
     round_count = 1
     start_time = time.time()
 
-    while len(results["unofficial_sites"]) < NEEDED_UNOFFICIAL_SITES:
+    # Save the initial count of unofficial sites BEFORE adding new ones
+    initial_unofficial_count = len(results["unofficial_sites"])
+
+    # Now loop until we have replaced all dead links with new alive ones
+    while len(results["unofficial_sites"]) < (initial_unofficial_count + dead_links_to_fetch):
         if query_index >= len(QUERIES):
             query_index = 0
             round_count += 1
@@ -217,7 +349,7 @@ def crawl_anime_sites():
         query = QUERIES[query_index]
         query_index += 1
 
-        urls = self_healing_search(query, settings,)
+        urls = self_healing_search(query, settings)
 
         for url in urls:
             if url in found_set:
@@ -228,29 +360,31 @@ def crawl_anime_sites():
 
             if site_info:
                 site, category = site_info
-                if category == "unofficial":  # Only keep unofficial
+                if category == "unofficial":
                     found_set.add(site["url"])
                     results["unofficial_sites"].append(site)
 
             elapsed = format_duration(time.time() - start_time)
             print(f"[~] Progress: {total_checked} URLs checked | "
-                  f"{len(results['unofficial_sites'])}/{NEEDED_UNOFFICIAL_SITES} unofficial | "
+                  f"{len(results['unofficial_sites'])} unofficial | "
                   f"{len(misc_urls)} misc | Time Elapsed: {elapsed}")
 
-            if len(results["unofficial_sites"]) >= NEEDED_UNOFFICIAL_SITES:
+            # Stop crawling early if we've fetched enough new links
+            if len(results["unofficial_sites"]) >= (initial_unofficial_count + dead_links_to_fetch):
                 break
 
             time.sleep(DELAY_BETWEEN_REQUESTS)
 
-    # Sort unofficial by ad score
     results["unofficial_sites"].sort(key=lambda x: x.get("ad_score", 0))
-    results["misc"] = misc_urls
+    results["misc"].extend(misc_urls)
+    results["misc"] = list(set(results["misc"]))
 
-    # Save only unofficial & misc
+
+    # Save file
     save_results(results, OUTPUT_FOLDER, FILENAME_PATTERN, DATE_FORMAT)
     final_time = format_duration(time.time() - start_time)
     print(f"\n[✓] Finished! Checked {total_checked} URLs in {final_time}.")
-    print(f"[✓] Found {len(results['unofficial_sites'])} unofficial, and {len(results['misc'])} misc skipped sites.")
+    print(f"[✓] Found {len(results['unofficial_sites'])} unofficial sites in total.")
 
 if __name__ == "__main__":
     crawl_anime_sites()
