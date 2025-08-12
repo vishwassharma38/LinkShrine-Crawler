@@ -14,10 +14,6 @@ myenv/
 .env/
 *.env
 
-# === Output files ===
-output/*.json
-!output/results.json   # Keep only the final results.json tracked
-
 # === Logs ===
 *.log
 
