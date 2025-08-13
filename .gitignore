@@ -26,3 +26,7 @@ myenv/
 # === OS-specific ===
 .DS_Store
 Thumbs.db
+
+# === Folders ===
+output/**/*.json
+!output/
