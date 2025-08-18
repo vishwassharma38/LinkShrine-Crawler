@@ -323,23 +323,42 @@ def crawl_anime_sites():
     existing_data = load_latest_results()
     results = {"unofficial_sites": [], "misc": []}
 
-    dead_links_to_fetch = NEEDED_UNOFFICIAL_SITES
+    needed_unofficial_sites = NEEDED_UNOFFICIAL_SITES  # use global constant!
 
     if existing_data:
         updated_sites, updated_misc, dead_count = preflight_check_existing(existing_data)
         results["unofficial_sites"] = updated_sites
         results["misc"] = updated_misc
-        dead_links_to_fetch = dead_count
+
+        alive = len(updated_sites)
+        dead = dead_count
+        needed = needed_unofficial_sites
+
+        # --- New Logic ---
+        if alive >= needed:
+            # Already enough, just replace dead
+            dead_links_to_fetch = dead
+        else:
+            shortage = needed - alive
+            if alive + dead == needed:
+                dead_links_to_fetch = dead
+            else:
+                dead_links_to_fetch = shortage + dead
+
         print("\n[✓] Preflight Summary:")
-        print(f"    Alive Links: {len(updated_sites)}")
-        print(f"    Dead Links (Unofficial only): {dead_count}")
+        print(f"    Alive Links: {alive}")
+        print(f"    Dead Links (Unofficial only): {dead}")
         print(f"    Misc Links: {len(updated_misc)}")
+        print(f"    Needed Unofficial Sites: {needed}")
+        print(f"    Will fetch: {dead_links_to_fetch} new unofficial sites")
+
     else:
         results["misc"] = []
         print("[!] No existing results found — starting from scratch.")
+        dead_links_to_fetch = needed_unofficial_sites
 
     if dead_links_to_fetch <= 0:
-        print("\n[✓] No dead unofficial links found. Updating file and finishing.")
+        print("\n[✓] No new unofficial links required. Updating file and finishing.")
         save_results(results, OUTPUT_FOLDER, FILENAME_PATTERN, DATE_FORMAT)
         return
 
