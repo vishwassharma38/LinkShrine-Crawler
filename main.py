@@ -1,3 +1,4 @@
+import asyncio
 import glob
 import json
 import os
@@ -6,7 +7,7 @@ import time
 from datetime import datetime
 from urllib.parse import urlparse
 
-import requests
+import aiohttp
 import tldextract
 from bs4 import BeautifulSoup
 
@@ -30,7 +31,7 @@ with open(settings_path, "r", encoding="utf-8") as f:
 
 # --- Filters ---
 BLOCKED_DOMAINS = filters["blocked_domains"]
-BLACKLIST_PATTERNS = [re.compile(p, re.IGNORECASE) for p in filters["blacklist_patterns"]]
+BLACKLIST_PATTERNS = [re.compile(p, re.IGNORECASE) for p in filters["blacklist_patterns"]] if filters["blacklist_patterns"] else []
 OFFICIAL_STREAMING_SITES = filters["official_streaming_sites"]
 STREAM_HOSTS = filters["stream_hosts"]
 AD_HOSTS = filters.get("ad_hosts", [])
@@ -67,28 +68,84 @@ DATE_FORMAT = settings["output"]["date_format"]
 def is_probable_streaming_site(html_content):
     keywords = filters.get("stream_keywords", [])
     js_players = filters.get("stream_js_players", [])
+    
+    # Skip processing if both arrays are empty
+    if not keywords and not js_players:
+        return False
+    
     content = html_content.lower()
-    keyword_hits = sum(1 for k in keywords if k in content)
-    js_hits = sum(1 for p in js_players if p in content)
+    keyword_hits = sum(1 for k in keywords if k in content) if keywords else 0
+    js_hits = sum(1 for p in js_players if p in content) if js_players else 0
     return keyword_hits >= 5 or js_hits >= 2
 
 def count_path_segments(path):
     return len([seg for seg in path.split("/") if seg.strip()])
+
+def matches_site_description(html, mode="unofficial"):
+    """Check if <title>, og:title, meta description, or og:description 
+    contains any keywords from filters['site_description'].
+
+    Thresholds:
+    - unofficial: at least 2 keyword hits
+    - misc: at least 1 keyword hit
+    """
+    site_desc_keywords = filters.get("site_description", [])
+    if not site_desc_keywords:
+        return False
+
+    soup = BeautifulSoup(html, "html.parser")
+    desc_content = ""
+
+    # <title>
+    title_tag = soup.find("title")
+    if title_tag and title_tag.text:
+        desc_content += title_tag.text.lower() + " "
+
+    # og:title
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if og_title and og_title.get("content"):
+        desc_content += og_title.get("content").lower() + " "
+
+    # meta description
+    meta = soup.find("meta", attrs={"name": "description"})
+    if meta and meta.get("content"):
+        desc_content += meta.get("content").lower() + " "
+
+    # og:description
+    og_desc = soup.find("meta", attrs={"property": "og:description"})
+    if og_desc and og_desc.get("content"):
+        desc_content += og_desc.get("content").lower()
+
+    if not desc_content.strip():
+        return False
+
+    # Count keyword hits
+    hits = sum(1 for keyword in site_desc_keywords if keyword in desc_content)
+
+    if mode == "misc":
+        return hits >= 1 # for "misc"
+    return hits >= 2  # for "unofficial"
 
 def is_streaming_site(html, url):
     domain = urlparse(url).netloc.lower()
     path = urlparse(url).path.lower()
     url_length = len(url)
 
-    if any(bad in domain for bad in BLOCKED_DOMAINS):
+    # Skip blocked domains check if list is empty
+    if BLOCKED_DOMAINS and any(bad in domain for bad in BLOCKED_DOMAINS):
         log_skip("Blocked domain", domain)
         return False
-    if any(p.search(url) for p in BLACKLIST_PATTERNS):
+    
+    # Skip blacklist pattern check if list is empty
+    if BLACKLIST_PATTERNS and any(p.search(url) for p in BLACKLIST_PATTERNS):
         log_skip("Blacklist pattern matched", url)
         return False
-    if any(path.endswith(ext) for ext in BLOCKED_EXTENSIONS):
+    
+    # Skip blocked extensions check if list is empty
+    if BLOCKED_EXTENSIONS and any(path.endswith(ext) for ext in BLOCKED_EXTENSIONS):
         log_skip("Unsupported file extension", path)
         return False
+    
     if count_path_segments(path) > MAX_PATH_SEGMENTS:
         log_skip("Path too deep", f"{count_path_segments(path)} segments: {path}")
         return False
@@ -98,14 +155,19 @@ def is_streaming_site(html, url):
 
     soup = BeautifulSoup(html, "html.parser")
     has_video = bool(soup.find("video"))
-    has_stream_host_iframe = any(
-        any(host in iframe.get("src", "").lower() for host in STREAM_HOSTS)
-        for iframe in soup.find_all("iframe")
-    )
+    
+    # Skip stream host iframe check if list is empty
+    has_stream_host_iframe = False
+    if STREAM_HOSTS:
+        has_stream_host_iframe = any(
+            any(host in iframe.get("src", "").lower() for host in STREAM_HOSTS)
+            for iframe in soup.find_all("iframe")
+        )
+    
     has_keywords = is_probable_streaming_site(html)
 
     if url_length <= URL_LENGTH_SHORT:
-        result = has_video or has_keywords or has_stream_host_iframe
+        result = (has_video or has_keywords or has_stream_host_iframe) and matches_site_description(html, "unofficial")
     elif url_length <= URL_LENGTH_MEDIUM:
         result = (has_video and has_keywords) or has_stream_host_iframe
     else:
@@ -117,9 +179,11 @@ def is_streaming_site(html, url):
 
 def classify_site(url):
     domain = urlparse(url).netloc.lower()
-    for official in OFFICIAL_STREAMING_SITES:
-        if official.replace("www.", "") in domain:
-            return "official"
+    # Skip official streaming sites check if list is empty
+    if OFFICIAL_STREAMING_SITES:
+        for official in OFFICIAL_STREAMING_SITES:
+            if official.replace("www.", "") in domain:
+                return "official"
     return "unofficial"
 
 def get_site_name(html, url):
@@ -137,62 +201,71 @@ def extract_description(html):
     title = soup.title.string.strip() if soup.title and soup.title.string else None
     return title or "No description found"
 
-def check_url(url, misc_urls, found_set):
+async def check_url(session, url, misc_urls, found_set):
     domain = urlparse(url).netloc.lower()
     path = urlparse(url).path.lower()
     url_length = len(url)
     path_segment_count = count_path_segments(path)
+    parsed_url = urlparse(url)
 
-    # Skip blocked domains early
-    if any(bad in domain for bad in BLOCKED_DOMAINS):
+    # Skip blocked domains early (only if list is not empty)
+    if BLOCKED_DOMAINS and any(bad in domain for bad in BLOCKED_DOMAINS):
         log_skip("Blocked domain", url)
         return None
 
-    # Skip official streaming sites early
-    for official in OFFICIAL_STREAMING_SITES:
-        if official.replace("www.", "") in domain:
-            log_skip("Official site", url)
-            return None
+    # Skip official streaming sites early (only if list is not empty)
+    if OFFICIAL_STREAMING_SITES:
+        for official in OFFICIAL_STREAMING_SITES:
+            if official.replace("www.", "") in domain:
+                log_skip("Official site", url)
+                return None
 
     try:
-        response = requests.get(url, headers=get_headers(settings), timeout=REQUEST_TIMEOUT)
-        if response.status_code == 200:
-            if is_streaming_site(response.text, url):
-                # Always classify as unofficial (since official sites are skipped)
-                site_name = get_site_name(response.text, url)
-                ad_score = detect_ads(response.text)
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        async with session.get(url, headers=get_headers(settings), timeout=timeout) as response:
+            if response.status == 200:
+                html_content = await response.text()
+                if is_streaming_site(html_content, url):
+                    # Always classify as unofficial (since official sites are skipped)
+                    site_name = get_site_name(html_content, url)
+                    ad_score = detect_ads(html_content)
 
-                if ad_score >= HEAVY_ADS_THRESHOLD:
-                    warning = "⚠️ This site contains heavy ads and pop-ups."
-                elif ad_score >= MODERATE_ADS_THRESHOLD:
-                    warning = "⚠️ This site has a moderate amount of ads."
-                elif ad_score >= LIGHT_ADS_THRESHOLD:
-                    warning = "ℹ️ Light ads present — browsing should be smooth."
-                else:
-                    warning = "✅ No ads detected — clean experience."
+                    if ad_score >= HEAVY_ADS_THRESHOLD:
+                        warning = "⚠️ This site contains heavy ads and pop-ups."
+                    elif ad_score >= MODERATE_ADS_THRESHOLD:
+                        warning = "⚠️ This site has a moderate amount of ads."
+                    elif ad_score >= LIGHT_ADS_THRESHOLD:
+                        warning = "ℹ️ Light ads present — browsing should be smooth."
+                    else:
+                        warning = "✅ No ads detected — clean experience."
 
-                print(f"[+ UNOFFICIAL] {url} — {site_name} | Ad Score: {ad_score}")
+                    print(f"[+ UNOFFICIAL] {url} — {site_name} | Ad Score: {ad_score}")
 
-                return {
-                    "url": url,
-                    "url_name": site_name,
-                    "status": "alive",
-                    "last_checked": datetime.utcnow().isoformat() + "Z",
-                    "type": "sub/dub",
-                    "description": extract_description(response.text),
-                    "ad_score": ad_score,
-                    "warning": warning
-                }, "unofficial"
-        else:
-            log_error("HTTP", url, f"Non-200 response: {response.status_code}")
+                    return {
+                        "url": url,
+                        "url_name": site_name,
+                        "status": "alive",
+                        "last_checked": datetime.utcnow().isoformat() + "Z",
+                        "type": "sub/dub",
+                        "description": extract_description(html_content),
+                        "ad_score": ad_score,
+                        "warning": warning
+                    }, "unofficial"
+
+                # Add to misc if short/simple, no query params, AND passes description check
+                if (url_length <= URL_LENGTH_SHORT and 
+                    path_segment_count <= MAX_PATH_SEGMENTS and 
+                    not parsed_url.query and 
+                    matches_site_description(html_content, "misc")):
+                    if url not in found_set:
+                        found_set.add(url)
+                        misc_urls.append(url)
+                        print(f"[+ MISC] {url}")
+            else:
+                log_error("HTTP", url, f"Non-200 response: {response.status}")
     except Exception as e:
         log_error("Request", url, e)
 
-    # Add to misc if short & simple
-    if url_length <= URL_LENGTH_SHORT and path_segment_count <= MAX_PATH_SEGMENTS:
-        if url not in found_set:
-            found_set.add(url)
-            misc_urls.append(url)
     return None
 
 # --- Main Crawl ---
@@ -214,6 +287,10 @@ def extract_domain(url):
 
 def is_blocked_domain(url, blocked_domains):
     """Check if URL's domain is in the blocked domains list."""
+    # Skip check if blocked_domains is empty
+    if not blocked_domains:
+        return False
+    
     domain = extract_domain(url)
     if not domain:
         return False
@@ -228,7 +305,58 @@ def load_latest_results():
     with open(latest_file, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def preflight_check_existing(results):
+async def check_single_url_preflight(session, entry, blocked_domains):
+    """Check a single URL during preflight check."""
+    url = entry.get("url")
+    category = entry.get("_category")
+
+    # Check if domain is blocked (skip if blocked_domains is empty)
+    if blocked_domains and is_blocked_domain(url, blocked_domains):
+        domain = extract_domain(url)
+        log_error("Blocked Domain", url, f"Domain '{domain}' is in blocked_domains list")
+        return None, "blocked", category
+
+    # If not blocked, perform HTTP check only for unofficial sites
+    if category == "unofficial":
+        try:
+            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            async with session.get(url, headers=get_headers(settings), timeout=timeout) as response:
+                if response.status == 200:
+                    html_content = await response.text()
+                    ad_score = detect_ads(html_content)
+                    entry["last_checked"] = datetime.utcnow().isoformat() + "Z"
+                    entry["ad_score"] = ad_score
+
+                    if ad_score >= HEAVY_ADS_THRESHOLD:
+                        entry["warning"] = "⚠️ This site contains heavy ads and pop-ups."
+                    elif ad_score >= MODERATE_ADS_THRESHOLD:
+                        entry["warning"] = "⚠️ This site has a moderate amount of ads."
+                    elif ad_score >= LIGHT_ADS_THRESHOLD:
+                        entry["warning"] = "ℹ️ Light ads present — browsing should be smooth."
+                    else:
+                        entry["warning"] = "✅ No ads detected — clean experience."
+
+                    return entry, "alive", category
+
+                elif response.status == 403:
+                    # Special handling: keep site in list, don't mark dead
+                    entry["last_checked"] = datetime.utcnow().isoformat() + "Z"
+                    entry["warning"] = "⚠️ Site responded with 403 (Forbidden). Preserved in list."
+                    return entry, "forbidden", category
+
+                else:
+                    # Other non-200 responses → dead
+                    log_error("HTTP", url, f"Non-200 response: {response.status}")
+                    return None, "dead", category
+
+        except Exception as e:
+            log_error("Request", url, e)
+            return None, "dead", category
+    else:
+        # Keep misc URLs that are not blocked
+        return url, "alive", category
+
+async def preflight_check_existing(results):
     """
     Check all URLs in the JSON, update alive ones, remove dead ones and blocked domains.
     Blocked domains in 'misc' are removed but do NOT increase dead_count or trigger fetching replacements.
@@ -240,7 +368,7 @@ def preflight_check_existing(results):
 
     # Get blocked domains from filters
     blocked_domains = filters.get("blocked_domains", [])
-    blocked_domains = [domain.lower() for domain in blocked_domains]
+    blocked_domains = [domain.lower() for domain in blocked_domains] if blocked_domains else []
 
     # Combine all URLs from unofficial_sites and misc for scanning
     all_entries = []
@@ -256,19 +384,39 @@ def preflight_check_existing(results):
     print(f"[~] Blocked domains loaded: {len(blocked_domains)}")
     print(f"[~] Scanning each link...")
 
+    # Create aiohttp session with connector settings
+    connector = aiohttp.TCPConnector(limit=settings["request"]["max_concurrent_requests"])
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # Create semaphore to limit concurrent requests
+        semaphore = asyncio.Semaphore(settings["request"]["max_concurrent_requests"])
+        
+        async def check_with_semaphore(entry):
+            async with semaphore:
+                return await check_single_url_preflight(session, entry, blocked_domains)
+        
+        # Process all URLs concurrently
+        tasks = [check_with_semaphore(entry) for entry in all_entries]
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
     scanned_count = 0
-
-    for entry in all_entries:
+    for i, result in enumerate(results_list):
         scanned_count += 1
+        entry = all_entries[i]
         url = entry.get("url")
-        category = entry.get("_category")
+        
+        if isinstance(result, Exception):
+            # Handle exceptions
+            log_error("Async Request", url, result)
+            if entry.get("_category") == "unofficial":
+                dead_count += 1
+            continue
+            
+        entry_result, status, category = result
 
-        # Check if domain is blocked
-        if is_blocked_domain(url, blocked_domains):
+        if status == "blocked":
             blocked_count += 1
-            domain = extract_domain(url)
-            log_error("Blocked Domain", url, f"Domain '{domain}' is in blocked_domains list")
-
             if category == "unofficial":
                 # Treat as dead for unofficial
                 dead_count += 1
@@ -276,36 +424,16 @@ def preflight_check_existing(results):
             else:
                 # Misc blocked — remove but do NOT count as dead
                 print(f"[{scanned_count}/{total_sites}] Blocked (Misc): {url} | Dead unchanged: {dead_count}")
-            continue
-
-        # If not blocked, perform HTTP check only for unofficial sites
-        if category == "unofficial":
-            try:
-                response = requests.get(url, headers=get_headers(settings), timeout=REQUEST_TIMEOUT)
-                if response.status_code == 200:
-                    ad_score = detect_ads(response.text)
-                    entry["last_checked"] = datetime.utcnow().isoformat() + "Z"
-                    entry["ad_score"] = ad_score
-
-                    if ad_score >= HEAVY_ADS_THRESHOLD:
-                        entry["warning"] = "⚠️ This site contains heavy ads and pop-ups."
-                    elif ad_score >= MODERATE_ADS_THRESHOLD:
-                        entry["warning"] = "⚠️ This site has a moderate amount of ads."
-                    elif ad_score >= LIGHT_ADS_THRESHOLD:
-                        entry["warning"] = "ℹ️ Light ads present — browsing should be smooth."
-                    else:
-                        entry["warning"] = "✅ No ads detected — clean experience."
-
-                    updated_unofficial.append(entry)
-                else:
-                    dead_count += 1
-                    log_error("HTTP", url, f"Non-200 response: {response.status_code}")
-            except Exception as e:
+        elif status in ["alive", "forbidden"]:
+            if category == "unofficial":
+                updated_unofficial.append(entry_result)
+            else:
+                updated_misc.append(entry_result)
+            if status == "forbidden":
+                print(f"[{scanned_count}/{total_sites}] 403 but preserved: {url}")
+        elif status == "dead":
+            if category == "unofficial":
                 dead_count += 1
-                log_error("Request", url, e)
-        else:
-            # Keep misc URLs that are not blocked
-            updated_misc.append(url)
 
         # Progress output
         print(f"[{scanned_count}/{total_sites}] Checked: {url} | "
@@ -318,7 +446,92 @@ def preflight_check_existing(results):
 
     return updated_unofficial, updated_misc, dead_count
 
-def crawl_anime_sites():
+async def check_url_batch(session, urls, misc_urls, found_set, semaphore):
+    """Process a batch of URLs concurrently."""
+    async def check_single_with_semaphore(url):
+        async with semaphore:
+            return await check_url_async(session, url, misc_urls, found_set)
+    
+    tasks = [check_single_with_semaphore(url) for url in urls if url not in found_set]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    valid_results = []
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        if result is not None:
+            valid_results.append(result)
+    
+    return valid_results
+
+async def check_url_async(session, url, misc_urls, found_set):
+    domain = urlparse(url).netloc.lower()
+    path = urlparse(url).path.lower()
+    url_length = len(url)
+    path_segment_count = count_path_segments(path)
+    parsed_url = urlparse(url)
+
+    # Skip blocked domains early (only if list is not empty)
+    if BLOCKED_DOMAINS and any(bad in domain for bad in BLOCKED_DOMAINS):
+        log_skip("Blocked domain", url)
+        return None
+
+    # Skip official streaming sites early (only if list is not empty)
+    if OFFICIAL_STREAMING_SITES:
+        for official in OFFICIAL_STREAMING_SITES:
+            if official.replace("www.", "") in domain:
+                log_skip("Official site", url)
+                return None
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        async with session.get(url, headers=get_headers(settings), timeout=timeout) as response:
+            if response.status == 200:
+                html_content = await response.text()
+                if is_streaming_site(html_content, url):
+                    # Always classify as unofficial
+                    site_name = get_site_name(html_content, url)
+                    ad_score = detect_ads(html_content)
+
+                    if ad_score >= HEAVY_ADS_THRESHOLD:
+                        warning = "⚠️ This site contains heavy ads and pop-ups."
+                    elif ad_score >= MODERATE_ADS_THRESHOLD:
+                        warning = "⚠️ This site has a moderate amount of ads."
+                    elif ad_score >= LIGHT_ADS_THRESHOLD:
+                        warning = "ℹ️ Light ads present — browsing should be smooth."
+                    else:
+                        warning = "✅ No ads detected — clean experience."
+
+                    print(f"[+ UNOFFICIAL] {url} — {site_name} | Ad Score: {ad_score}")
+
+                    return {
+                        "url": url,
+                        "url_name": site_name,
+                        "status": "alive",
+                        "last_checked": datetime.utcnow().isoformat() + "Z",
+                        "type": "sub/dub",
+                        "description": extract_description(html_content),
+                        "ad_score": ad_score,
+                        "warning": warning
+                    }, "unofficial"
+
+                # Add to misc if short/simple, no query params, AND passes description check
+                if (url_length <= URL_LENGTH_SHORT and 
+                    path_segment_count <= MAX_PATH_SEGMENTS and 
+                    not parsed_url.query and 
+                    matches_site_description(html_content, "misc")):
+                    if url not in found_set:
+                        found_set.add(url)
+                        misc_urls.append(url)
+                        print(f"[+ MISC] {url}")
+            else:
+                log_error("HTTP", url, f"Non-200 response: {response.status}")
+    except Exception as e:
+        log_error("Request", url, e)
+
+    return None
+
+async def crawl_anime_sites():
     print("\n[~] Starting pre-flight check for existing results...\n")
     existing_data = load_latest_results()
     results = {"unofficial_sites": [], "misc": []}
@@ -326,7 +539,7 @@ def crawl_anime_sites():
     needed_unofficial_sites = NEEDED_UNOFFICIAL_SITES  # use global constant!
 
     if existing_data:
-        updated_sites, updated_misc, dead_count = preflight_check_existing(existing_data)
+        updated_sites, updated_misc, dead_count = await preflight_check_existing(existing_data)
         results["unofficial_sites"] = updated_sites
         results["misc"] = updated_misc
 
@@ -357,8 +570,19 @@ def crawl_anime_sites():
         print("[!] No existing results found — starting from scratch.")
         dead_links_to_fetch = needed_unofficial_sites
 
+    # --- Patched Preflight Backup ---
     if dead_links_to_fetch <= 0:
         print("\n[✓] No new unofficial links required. Updating file and finishing.")
+
+        # Use existing data if available to keep metadata intact
+        if existing_data:
+            results = existing_data
+
+        # Refresh last_checked so backup always reflects the check
+        for site in results.get("unofficial_sites", []):
+            site["last_checked"] = datetime.utcnow().isoformat() + "Z"
+
+        # Save (this also pushes to Supabase)
         save_results(results, OUTPUT_FOLDER, FILENAME_PATTERN, DATE_FORMAT)
         return
 
@@ -372,30 +596,41 @@ def crawl_anime_sites():
 
     initial_unofficial_count = len(results["unofficial_sites"])
 
-    while len(results["unofficial_sites"]) < (initial_unofficial_count + dead_links_to_fetch):
-        if query_index >= len(QUERIES):
-            query_index = 0
-            round_count += 1
-            print(f"\n[~] Starting round {round_count} of queries...\n")
+    # Create aiohttp session with connector settings
+    connector = aiohttp.TCPConnector(limit=settings["request"]["max_concurrent_requests"])
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    semaphore = asyncio.Semaphore(settings["request"]["max_concurrent_requests"])
 
-        query = QUERIES[query_index]
-        query_index += 1
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        while len(results["unofficial_sites"]) < (initial_unofficial_count + dead_links_to_fetch):
+            if query_index >= len(QUERIES):
+                query_index = 0
+                round_count += 1
+                print(f"\n[~] Starting round {round_count} of queries...\n")
 
-        urls = self_healing_search(query, settings)
+            query = QUERIES[query_index]
+            query_index += 1
 
-        for url in urls:
-            if url in found_set:
+            # Get URLs from search (this remains synchronous as it's external dependency)
+            urls = self_healing_search(query, settings)
+            
+            # Filter out already found URLs
+            new_urls = [url for url in urls if url not in found_set]
+            
+            if not new_urls:
                 continue
 
-            site_info = check_url(url, misc_urls, found_set)
-            total_checked += 1
+            # Process URLs in batches
+            batch_results = await check_url_batch(session, new_urls, misc_urls, found_set, semaphore)
+            
+            for site_info in batch_results:
+                if site_info:
+                    site, category = site_info
+                    if category == "unofficial":
+                        found_set.add(site["url"])
+                        results["unofficial_sites"].append(site)
 
-            if site_info:
-                site, category = site_info
-                if category == "unofficial":
-                    found_set.add(site["url"])
-                    results["unofficial_sites"].append(site)
-
+            total_checked += len(new_urls)
             elapsed = format_duration(time.time() - start_time)
             print(f"[~] Progress: {total_checked} URLs checked | "
                   f"{len(results['unofficial_sites'])} unofficial | "
@@ -404,7 +639,8 @@ def crawl_anime_sites():
             if len(results["unofficial_sites"]) >= (initial_unofficial_count + dead_links_to_fetch):
                 break
 
-            time.sleep(DELAY_BETWEEN_REQUESTS)
+            # Add delay between query batches instead of individual requests
+            await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
 
     results["unofficial_sites"].sort(key=lambda x: x.get("ad_score", 0))
     results["misc"].extend(misc_urls)
@@ -415,5 +651,6 @@ def crawl_anime_sites():
     print(f"\n[✓] Finished! Checked {total_checked} URLs in {final_time}.")
     print(f"[✓] Found {len(results['unofficial_sites'])} unofficial sites in total.")
 
+
 if __name__ == "__main__":
-    crawl_anime_sites()
+    asyncio.run(crawl_anime_sites())
